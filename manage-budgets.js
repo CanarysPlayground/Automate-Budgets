@@ -89,9 +89,9 @@ const runSummary = {
 };
 
 /**
- * Robustly parses the CSV file and extracts User and Budget values
+ * Robustly parses the CSV file and extracts User, Budget, and optional Expiration values
  * @param {string} filePath Path to the CSV file
- * @returns {Array<{user: string, budget: number}>} List of users and their budgets
+ * @returns {Array<{user: string, budget: number, expiration: string}>} List of users and their budgets
  */
 function parseCSV(filePath) {
   console.log(`Reading CSV file from path: ${filePath}`);
@@ -110,6 +110,7 @@ function parseCSV(filePath) {
     const row = rows[idx];
     let userVal = null;
     let budgetVal = null;
+    let expirationVal = null;
 
     for (const key of Object.keys(row)) {
       const normalizedKey = key.trim().toLowerCase();
@@ -122,6 +123,8 @@ function parseCSV(filePath) {
         normalizedKey === 'budget_amount'
       ) {
         budgetVal = row[key];
+      } else if (normalizedKey === 'expiration' || normalizedKey === 'expires' || normalizedKey === 'expires_at') {
+        expirationVal = row[key];
       }
     }
 
@@ -138,7 +141,15 @@ function parseCSV(filePath) {
         continue;
       }
 
-      parsedData.push({ user: username, budget: budget });
+      let expiration;
+      try {
+        expiration = normalizeExpiration(expirationVal);
+      } catch (error) {
+        console.warn(`Row ${idx + 2} (${username}): Skipped because expiration is invalid: "${expirationVal}". ${error.message}`);
+        continue;
+      }
+
+      parsedData.push({ user: username, budget, expiration });
     } else {
       console.warn(`Row ${idx + 2}: Skipped because User or Budget column could not be identified. Row keys: ${Object.keys(row).join(', ')}`);
     }
@@ -146,6 +157,74 @@ function parseCSV(filePath) {
 
   console.log(`Successfully parsed ${parsedData.length} records from CSV.`);
   return parsedData;
+}
+
+/**
+ * Normalizes a CSV expiration value to never, next_billing_cycle, or YYYY-MM-DD.
+ * @param {string|number|null} value Expiration value from the CSV
+ * @returns {string} Normalized expiration option
+ */
+function normalizeExpiration(value) {
+  if (typeof value === 'number') {
+    const parsedDate = xlsx.SSF.parse_date_code(value);
+    if (parsedDate && parsedDate.y >= 1970) {
+      const excelDate = [
+        String(parsedDate.y).padStart(4, '0'),
+        String(parsedDate.m).padStart(2, '0'),
+        String(parsedDate.d).padStart(2, '0')
+      ].join('-');
+      return normalizeExpiration(excelDate);
+    }
+  }
+
+  const expiration = value === null || value === undefined ? '' : String(value).trim().toLowerCase();
+
+  if (!expiration || expiration === 'never' || expiration === 'never expires') {
+    return 'never';
+  }
+  if (expiration === 'next_billing_cycle') {
+    return expiration;
+  }
+
+  const dateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(expiration);
+  if (dateMatch) {
+    const [, year, month, day] = dateMatch;
+    const date = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
+    if (
+      date.getUTCFullYear() === Number(year) &&
+      date.getUTCMonth() === Number(month) - 1 &&
+      date.getUTCDate() === Number(day)
+    ) {
+      return expiration;
+    }
+  }
+
+  throw new Error('Use "never", "next_billing_cycle", or a valid YYYY-MM-DD date.');
+}
+
+/**
+ * Resolves a normalized expiration option to the API's date value.
+ * @param {string} expiration Normalized expiration option
+ * @param {Date} [now] Current time, injectable for testing
+ * @returns {string|null} Expiration date or null for no expiration
+ */
+function resolveExpirationDate(expiration, now = new Date()) {
+  if (expiration === 'never') {
+    return null;
+  }
+  if (expiration === 'next_billing_cycle') {
+    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1))
+      .toISOString()
+      .slice(0, 10);
+  }
+  return normalizeExpiration(expiration);
+}
+
+function getExistingExpirationDate(budget) {
+  if (!budget.expires_at || budget.expires_at === 0) {
+    return null;
+  }
+  return String(budget.expires_at).slice(0, 10);
 }
 
 /**
@@ -207,7 +286,7 @@ async function fetchExistingBudgets(baseUrl, headers) {
 /**
  * Creates a new user budget
  */
-async function createBudget(baseUrl, headers, username, amount) {
+async function createBudget(baseUrl, headers, username, amount, expiresAt = null) {
   console.log(`[CREATE] Creating new budget of $${amount.toFixed(2)} for user: ${username}`);
   const payload = {
     budget_amount: amount,
@@ -218,6 +297,9 @@ async function createBudget(baseUrl, headers, username, amount) {
     budget_type: 'BundlePricing',
     budget_alerting: { will_alert: false, alert_recipients: [] }
   };
+  if (expiresAt) {
+    payload.expires_at = expiresAt;
+  }
 
   const response = await fetchWithRetry(baseUrl, {
     method: 'POST',
@@ -238,12 +320,13 @@ async function createBudget(baseUrl, headers, username, amount) {
 /**
  * Updates an existing user budget
  */
-async function updateBudget(baseUrl, headers, budgetId, username, amount) {
+async function updateBudget(baseUrl, headers, budgetId, username, amount, expiresAt = null) {
   console.log(`[UPDATE] Updating budget of user ${username} to $${amount.toFixed(2)} (Budget ID: ${budgetId})`);
   const payload = {
     budget_amount: amount,    
     user: username,
     prevent_further_usage: true,
+    expires_at: expiresAt,
     budget_alerting: { will_alert: false, alert_recipients: [] }
   };
 
@@ -501,14 +584,15 @@ async function syncBudgets() {
     for (const record of newBudgets) {
       const usernameLower = record.user.toLowerCase();
       const newAmount = record.budget;
+      const expiresAt = resolveExpirationDate(record.expiration);
 
       const existingBudget = existingBudgets.get(usernameLower);
 
       if (existingBudget) {
         const oldAmount = existingBudget.budget_amount;
-        if (oldAmount !== newAmount) {
+        if (oldAmount !== newAmount || getExistingExpirationDate(existingBudget) !== expiresAt) {
           try {
-            await updateBudget(API_BASE_URL, headers, existingBudget.id, record.user, newAmount);
+            await updateBudget(API_BASE_URL, headers, existingBudget.id, record.user, newAmount, expiresAt);
             runSummary.updated.push({ user: record.user, oldBudget: oldAmount, newBudget: newAmount });
           } catch (err) {
             console.error(`[ERROR] Failed to update budget for ${record.user}:`, err.message);
@@ -522,7 +606,7 @@ async function syncBudgets() {
         }
       } else {
         try {
-          await createBudget(API_BASE_URL, headers, record.user, newAmount);
+          await createBudget(API_BASE_URL, headers, record.user, newAmount, expiresAt);
           runSummary.created.push({ user: record.user, budget: newAmount });
         } catch (err) {
           console.error(`[ERROR] Failed to create budget for ${record.user}:`, err.message);
@@ -564,6 +648,7 @@ module.exports = {
   generateAllocationCSV,
   parseAllocationCSV,
   sleep,
-  fetchWithRetry
+  fetchWithRetry,
+  normalizeExpiration,
+  resolveExpirationDate
 };
-
